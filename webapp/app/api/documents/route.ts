@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { query } from "../../../lib/db";
 import { getUser, accessibleCourseIds } from "../../../lib/auth";
 import { chunkText } from "../../../lib/chunk";
+import { embed, toPgVector } from "../../../lib/embed";
 
 // List documents of one course
 export async function GET(req: Request) {
@@ -25,8 +26,8 @@ export async function GET(req: Request) {
   return NextResponse.json({ documents });
 }
 
-// Upload a document: text is chunked, then the upload_document() SQL function
-// inserts the document and ALL its chunks in one atomic transaction.
+// Upload a document: text is chunked, upload_document() inserts the document and ALL
+// chunks in one atomic transaction, then each chunk is embedded for semantic search.
 export async function POST(req: Request) {
   const user = await getUser();
   if (!user) return NextResponse.json({ error: "Not logged in" }, { status: 401 });
@@ -45,12 +46,13 @@ export async function POST(req: Request) {
   }
 
   const chunks = chunkText(String(text));
+  let docId: number;
   try {
     const rows = await query<{ doc_id: number }>(
       "SELECT upload_document($1, $2, $3, $4, $5::text[]) AS doc_id",
       [course_id, user.id, String(title).trim(), file_type, chunks]
     );
-    return NextResponse.json({ doc_id: rows[0].doc_id, chunks: chunks.length }, { status: 201 });
+    docId = rows[0].doc_id;
   } catch (e) {
     const err = e as { code?: string; message: string };
     if (err.code === "23505") {
@@ -60,4 +62,22 @@ export async function POST(req: Request) {
     // Database-level validation (CHECK / NOT NULL / FK) rejected the data
     return NextResponse.json({ error: "Database rejected the upload: " + err.message }, { status: 400 });
   }
+
+  // Embed each chunk. If this fails the upload still succeeds (keyword search still works),
+  // and the "Generate embeddings" button can fill in the gaps later.
+  let embedded = 0;
+  try {
+    const chunkRows = await query<{ chunk_id: number; content: string }>(
+      "SELECT chunk_id, content FROM document_chunks WHERE doc_id = $1 ORDER BY chunk_index", [docId]);
+    for (const c of chunkRows) {
+      const v = await embed(c.content);
+      await query("UPDATE document_chunks SET embedding = $1::vector WHERE chunk_id = $2",
+        [toPgVector(v), c.chunk_id]);
+      embedded++;
+    }
+  } catch (e) {
+    console.error("Embedding failed:", e);
+  }
+
+  return NextResponse.json({ doc_id: docId, chunks: chunks.length, embedded }, { status: 201 });
 }

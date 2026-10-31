@@ -1,6 +1,8 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  serverExternalPackages: ['@huggingface/transformers'],
+
   /* config options here */
   experimental: {
     agentFeedback: true,
@@ -18,3 +20,4 @@ const nextConfig: NextConfig = {
 };
 
 export default nextConfig;
+

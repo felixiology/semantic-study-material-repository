@@ -17,6 +17,7 @@ export default function Dashboard() {
   const [courseId, setCourseId] = useState<number | null>(null);
   const [docs, setDocs] = useState<Doc[]>([]);
   const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
   const [title, setTitle] = useState("");
   const [fileType, setFileType] = useState("pdf");
   const [text, setText] = useState("");
@@ -39,18 +40,29 @@ export default function Dashboard() {
 
   async function upload(e: React.FormEvent) {
     e.preventDefault();
-    setMsg("");
+    setMsg("Uploading and generating embeddings... (the first time can take a minute while the model downloads)");
+    setBusy(true);
     const r = await fetch("/api/documents", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ course_id: courseId, title, file_type: fileType, text }),
     });
     const data = await r.json();
+    setBusy(false);
     if (!r.ok) { setMsg("Error: " + data.error); return; }
-    setMsg(`Uploaded! Stored as ${data.chunks} searchable chunks.`);
+    setMsg(`Uploaded! ${data.chunks} chunks stored, ${data.embedded} embedded for semantic search.`);
     setTitle(""); setText("");
     if (courseId) loadDocs(courseId);
     loadCourses();
+  }
+
+  async function embedAll() {
+    setBusy(true);
+    setMsg("Generating embeddings... (the first time can take a minute while the model downloads)");
+    const r = await fetch("/api/embed", { method: "POST" });
+    const data = await r.json();
+    setBusy(false);
+    setMsg(r.ok ? `Done: embedded ${data.embedded} chunks.` : "Error: " + data.error);
   }
 
   async function remove(id: number) {
@@ -121,6 +133,18 @@ export default function Dashboard() {
         </section>
 
         {canUpload && (
+          <section className="bg-white rounded-lg shadow p-4 flex items-center gap-4">
+            <button onClick={embedAll} disabled={busy}
+                    className="bg-emerald-700 text-white rounded px-4 py-2 disabled:opacity-60">
+              Generate missing embeddings
+            </button>
+            <span className="text-sm text-gray-500">
+              Creates the 384-dimension vectors that power semantic search for any chunk that does not have one yet.
+            </span>
+          </section>
+        )}
+
+        {canUpload && (
           <form onSubmit={upload} className="bg-white rounded-lg shadow p-4 space-y-3">
             <h2 className="font-semibold">Upload study material to the selected course</h2>
             <div className="flex gap-3">
@@ -134,7 +158,7 @@ export default function Dashboard() {
             <textarea className="border rounded px-3 py-2 w-full h-40"
                       placeholder="Paste the text of the notes here (or pick a .txt file above)"
                       value={text} onChange={(e) => setText(e.target.value)} required />
-            <button className="bg-indigo-700 text-white rounded px-4 py-2">Upload</button>
+            <button disabled={busy} className="bg-indigo-700 text-white rounded px-4 py-2 disabled:opacity-60">Upload</button>
           </form>
         )}
 

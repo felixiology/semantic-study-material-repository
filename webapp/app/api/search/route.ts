@@ -2,6 +2,10 @@ import { NextResponse } from "next/server";
 import { query } from "../../../lib/db";
 import { mongoDb } from "../../../lib/mongo";
 import { getUser, accessibleCourseIds } from "../../../lib/auth";
+import { embed, toPgVector } from "../../../lib/embed";
+
+// Chunks less similar than this (cosine similarity) are treated as "not relevant".
+const MIN_SIMILARITY = 0.2;
 
 export async function GET(req: Request) {
   const user = await getUser();
@@ -10,34 +14,64 @@ export async function GET(req: Request) {
   const params = new URL(req.url).searchParams;
   const q = (params.get("q") ?? "").trim();
   const courseParam = params.get("course_id");
-  if (!q) return NextResponse.json({ results: [] });
+  const requestedMode = params.get("mode") === "keyword" ? "keyword" : "semantic";
+  if (!q) return NextResponse.json({ results: [], mode: requestedMode });
 
   // Only search inside courses this user may access (role-based access)
   let ids = await accessibleCourseIds(user);
   if (courseParam) ids = ids.filter((id) => id === Number(courseParam));
 
-  // Keep only letters/digits so the tsquery is safe; OR the words together.
-  const words = (q.toLowerCase().match(/[a-z0-9]+/g) ?? []).filter((w) => w.length > 2);
   let results: unknown[] = [];
+  let mode: "semantic" | "keyword" = requestedMode;
 
-  if (words.length > 0 && ids.length > 0) {
-    results = await query(
-      `SELECT ch.chunk_id, d.title, c.code, ch.page_no,
-              ts_headline('english', ch.content, q.tsq,
-                'StartSel=<<, StopSel=>>, MaxWords=40, MinWords=15, MaxFragments=1') AS snippet,
-              ts_rank(ch.content_tsv, q.tsq)::float AS rank
-       FROM document_chunks ch
-       JOIN documents d ON d.doc_id = ch.doc_id
-       JOIN courses c ON c.course_id = d.course_id
-       CROSS JOIN (SELECT to_tsquery('english', $1) AS tsq) q
-       WHERE ch.content_tsv @@ q.tsq AND d.course_id = ANY($2::int[])
-       ORDER BY rank DESC
-       LIMIT 10`,
-      [words.join(" | "), ids]
-    );
+  // ---------- Semantic (vector) search ----------
+  if (requestedMode === "semantic" && ids.length > 0) {
+    try {
+      const vec = toPgVector(await embed(q));
+      // <=> is pgvector's cosine DISTANCE; similarity = 1 - distance.
+      results = await query(
+        `SELECT ch.chunk_id, d.title, c.code, ch.page_no,
+                LEFT(ch.content, 320) AS snippet,
+                (1 - (ch.embedding <=> $1::vector))::float AS rank
+         FROM document_chunks ch
+         JOIN documents d ON d.doc_id = ch.doc_id
+         JOIN courses c ON c.course_id = d.course_id
+         WHERE ch.embedding IS NOT NULL
+           AND d.course_id = ANY($2::int[])
+           AND (1 - (ch.embedding <=> $1::vector)) >= $3
+         ORDER BY ch.embedding <=> $1::vector
+         LIMIT 10`,
+        [vec, ids, MIN_SIMILARITY]
+      );
+    } catch (e) {
+      console.error("Semantic search failed, falling back to keyword:", e);
+      mode = "keyword";
+    }
   }
 
-  // Log every search to MongoDB (flexible, write-heavy data). Never break search if Mongo is down.
+  // ---------- Keyword (full-text) search ----------
+  if (mode === "keyword" && ids.length > 0) {
+    // Keep only letters/digits so the tsquery is safe; OR the words together.
+    const words = (q.toLowerCase().match(/[a-z0-9]+/g) ?? []).filter((w) => w.length > 2);
+    if (words.length > 0) {
+      results = await query(
+        `SELECT ch.chunk_id, d.title, c.code, ch.page_no,
+                ts_headline('english', ch.content, q.tsq,
+                  'StartSel=<<, StopSel=>>, MaxWords=40, MinWords=15, MaxFragments=1') AS snippet,
+                ts_rank(ch.content_tsv, q.tsq)::float AS rank
+         FROM document_chunks ch
+         JOIN documents d ON d.doc_id = ch.doc_id
+         JOIN courses c ON c.course_id = d.course_id
+         CROSS JOIN (SELECT to_tsquery('english', $1) AS tsq) q
+         WHERE ch.content_tsv @@ q.tsq AND d.course_id = ANY($2::int[])
+         ORDER BY rank DESC
+         LIMIT 10`,
+        [words.join(" | "), ids]
+      );
+    }
+  }
+
+  // Log every search to MongoDB. Never break search if Mongo is down.
   try {
     const db = await mongoDb();
     await db.collection("search_logs").insertOne({
@@ -45,6 +79,7 @@ export async function GET(req: Request) {
       role: user.role,
       course_id: courseParam ? Number(courseParam) : null,
       query: q,
+      mode,
       result_count: results.length,
       top_score: results.length ? (results[0] as { rank: number }).rank : null,
       searched_at: new Date(),
@@ -53,5 +88,6 @@ export async function GET(req: Request) {
     console.error("Mongo log failed:", e);
   }
 
-  return NextResponse.json({ results });
+  return NextResponse.json({ results, mode });
 }
+
